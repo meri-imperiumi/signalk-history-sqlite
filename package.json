@@ -1,6 +1,6 @@
 {
   "name": "@meri-imperiumi/signalk-history-sqlite",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Lightweight Signal K History API provider using Node.js built-in SQLite",
   "main": "index.js",
   "scripts": {
