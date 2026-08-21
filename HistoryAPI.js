@@ -367,36 +367,58 @@ class SQLiteHistoryProvider {
   ) {
     const fromMs = from.getTime();
     const toMs = to.getTime();
-
-    const sourceClause = sourceRef
-      ? `\n    AND\n    t.source = '${sourceRef}'`
-      : "";
-
     const bucketSize = Math.floor(timeResolutionMillis);
 
-    const query = `
-      SELECT
-        datetime((t.ts_ms / ${bucketSize}) * ${bucketSize} / 1000, 'unixepoch') AS time,
-        MIN(CASE WHEN m.name = 'navigation.position.longitude' THEN t.value END) AS longitude,
-        MIN(CASE WHEN m.name = 'navigation.position.latitude' THEN t.value END) AS latitude
-      FROM telemetry_real t
-      JOIN metrics m ON t.metric_id = m.id
-      WHERE
-        t.context = '${context}'
-        AND
-        t.ts_ms >= ${fromMs}
-        AND
-        t.ts_ms <= ${toMs}
-        AND
-        (m.name = 'navigation.position.longitude' OR m.name = 'navigation.position.latitude')
-        ${sourceClause}
-      GROUP BY time
-      ORDER BY time ASC
-    `;
+    let query;
+    let params;
+
+    if (sourceRef) {
+      query = `
+        SELECT
+          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          MIN(CASE WHEN m.name = 'navigation.position.longitude' THEN t.value END) AS longitude,
+          MIN(CASE WHEN m.name = 'navigation.position.latitude' THEN t.value END) AS latitude
+        FROM telemetry_real t
+        JOIN metrics m ON t.metric_id = m.id
+        WHERE
+          t.context = ?
+          AND
+          t.ts_ms >= ?
+          AND
+          t.ts_ms <= ?
+          AND
+          (m.name = 'navigation.position.longitude' OR m.name = 'navigation.position.latitude')
+          AND
+          t.source = ?
+        GROUP BY time
+        ORDER BY time ASC
+      `;
+      params = [bucketSize, bucketSize, context, fromMs, toMs, sourceRef];
+    } else {
+      query = `
+        SELECT
+          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          MIN(CASE WHEN m.name = 'navigation.position.longitude' THEN t.value END) AS longitude,
+          MIN(CASE WHEN m.name = 'navigation.position.latitude' THEN t.value END) AS latitude
+        FROM telemetry_real t
+        JOIN metrics m ON t.metric_id = m.id
+        WHERE
+          t.context = ?
+          AND
+          t.ts_ms >= ?
+          AND
+          t.ts_ms <= ?
+          AND
+          (m.name = 'navigation.position.longitude' OR m.name = 'navigation.position.latitude')
+        GROUP BY time
+        ORDER BY time ASC
+      `;
+      params = [bucketSize, bucketSize, context, fromMs, toMs];
+    }
 
     this.debug(query);
 
-    const rows = this.db.prepare(query).all();
+    const rows = this.db.prepare(query).all(...params);
 
     return {
       values: [
@@ -551,42 +573,82 @@ class SQLiteHistoryProvider {
       return acc;
     }, []);
 
-    const sourceClause = sourceRef
-      ? `\n    AND\n    t.source = '${sourceRef}'`
-      : "";
-
     const bucketSize = Math.floor(timeResolutionMillis);
 
-    // Build CASE statements for each path/aggregate combination
+    // Build CASE statements with parameterized paths
     const selectClauses = [];
     pathSpecs.forEach((ps, idx) => {
       selectClauses.push(
-        `${ps.aggregateFunction}(CASE WHEN m.name = '${ps.path}' THEN t.value END) AS "col_${idx}"`,
+        `${ps.aggregateFunction}(CASE WHEN m.name = ? THEN t.value END) AS "col_${idx}"`,
       );
     });
 
-    const query = `
-      SELECT
-        datetime((t.ts_ms / ${bucketSize}) * ${bucketSize} / 1000, 'unixepoch') AS time,
-        ${selectClauses.join(",\n        ")}
-      FROM telemetry_real t
-      JOIN metrics m ON t.metric_id = m.id
-      WHERE
-        t.context = '${context}'
-        AND
-        t.ts_ms >= ${fromMs}
-        AND
-        t.ts_ms <= ${toMs}
-        AND
-        m.name IN ('${uniquePaths.join("', '")}')
-        ${sourceClause}
-      GROUP BY time
-      ORDER BY time ASC
-    `;
+    // Build IN clause placeholders
+    const inPlaceholders = uniquePaths.map(() => '?').join(', ');
+
+    // Build query with parameters
+    let query;
+    let params;
+
+    if (sourceRef) {
+      query = `
+        SELECT
+          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          ${selectClauses.join(",\n        ")}
+        FROM telemetry_real t
+        JOIN metrics m ON t.metric_id = m.id
+        WHERE
+          t.context = ?
+          AND
+          t.ts_ms >= ?
+          AND
+          t.ts_ms <= ?
+          AND
+          m.name IN (${inPlaceholders})
+          AND
+          t.source = ?
+        GROUP BY time
+        ORDER BY time ASC
+      `;
+      // Build params: bucketSize (x2), pathSpec paths (for CASE), context, fromMs, toMs, uniquePaths (for IN), sourceRef
+      params = [
+        bucketSize, bucketSize,
+        ...pathSpecs.map(ps => ps.path),
+        context,
+        fromMs, toMs,
+        ...uniquePaths,
+        sourceRef
+      ];
+    } else {
+      query = `
+        SELECT
+          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          ${selectClauses.join(",\n        ")}
+        FROM telemetry_real t
+        JOIN metrics m ON t.metric_id = m.id
+        WHERE
+          t.context = ?
+          AND
+          t.ts_ms >= ?
+          AND
+          t.ts_ms <= ?
+          AND
+          m.name IN (${inPlaceholders})
+        GROUP BY time
+        ORDER BY time ASC
+      `;
+      params = [
+        bucketSize, bucketSize,
+        ...pathSpecs.map(ps => ps.path),
+        context,
+        fromMs, toMs,
+        ...uniquePaths
+      ];
+    }
 
     this.debug(query);
 
-    const rows = this.db.prepare(query).all();
+    const rows = this.db.prepare(query).all(...params);
     this.debug(`got ${rows.length} rows in ${Date.now() - start}ms`);
 
     const resultData = rows.map((row) => {
