@@ -23,7 +23,7 @@
   "author": "Henri Bergius <henri.bergius@iki.fi>",
   "license": "EUPL-1.2",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5"
   },
   "files": [
     "index.js",
