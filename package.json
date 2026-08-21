@@ -1,0 +1,42 @@
+{
+  "name": "@meri-imperiumi/signalk-history-sqlite",
+  "version": "1.0.0",
+  "description": "Lightweight Signal K History API provider using Node.js built-in SQLite",
+  "main": "index.js",
+  "scripts": {
+    "lint": "npx @biomejs/biome check --use-editorconfig=true *.js",
+    "format": "npx @biomejs/biome check --use-editorconfig=true --write *.js test/",
+    "test": "node --test test/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meri-imperiumi/signalk-history-sqlite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/meri-imperiumi/signalk-history-sqlite/issues"
+  },
+  "homepage": "https://github.com/meri-imperiumi/signalk-history-sqlite#readme",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-history"
+  ],
+  "author": "Henri Bergius <henri.bergius@iki.fi>",
+  "license": "EUPL-1.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "index.js",
+    "HistoryAPI.js",
+    "icon.svg",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "signalk": {
+    "displayName": "SQLite History Provider",
+    "appIcon": "./icon.png"
+  },
+  "dependencies": {}
+}
