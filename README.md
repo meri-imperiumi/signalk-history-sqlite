@@ -17,8 +17,8 @@ The plugin creates the following tables in a database file inside Signal K plugi
 - `metrics`: Dictionary mapping metric names to IDs
 - `telemetry_real`: Real-valued telemetry (numbers)
 - `telemetry_bool`: Boolean telemetry (switches, binary indicators)
-- `telemetry_string`: String telemetry (optional)
-- `telemetry_json`: JSON values (optional, for positions)
+- `telemetry_string`: String telemetry (status flags, mode names, enum values)
+- `telemetry_json`: Reserved for future use (not currently utilized)
 
 ## History API
 
@@ -50,10 +50,12 @@ GET /signalk/v2/api/history/paths?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:
 
 ## Storage Requirements
 
-Storage usage depends on the number of metrics, data frequency, and retention period. As a rough estimate:
+Storage usage depends on the number of metrics, data frequency, and retention period. With the default 1-second resolution, rough estimates are:
 
-- 1 metric sampled every second = ~25MB/month
-- 100 metrics sampled every second = ~2.5GB/month
+- 1 metric = ~25MB/month
+- 100 metrics = ~2.5GB/month
+
+For higher-frequency sampling, storage scales linearly with the sample rate.
 
 ## License
 

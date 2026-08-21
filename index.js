@@ -55,8 +55,8 @@ module.exports = (app) => {
           type: "number",
           title: "Resolution (ms)",
           description:
-            "Minimum time between storing values for the same path/source (default: 200)",
-          default: 200,
+            "Minimum time between storing values for the same path/source (default: 1000)",
+          default: 1000,
         },
         recordTrack: {
           type: "boolean",
@@ -190,13 +190,13 @@ module.exports = (app) => {
       // Get initial database stats
       const initialStats = getDatabaseStats();
       setStatus(
-        `Ready. Database: ${formatBytes(initialStats.dbSize)}, ${initialStats.metricCount} metrics, ${initialStats.realCount} real values, ${initialStats.boolCount} bool values${initialStats.timeRange ? ` (${initialStats.timeRange})` : ""}`,
+        `Ready. Database: ${formatBytes(initialStats.dbSize)}, ${initialStats.metricCount} metrics, ${initialStats.realCount} real, ${initialStats.boolCount} bool, ${initialStats.stringCount} string values${initialStats.timeRange ? ` (${initialStats.timeRange})` : ""}`,
       );
 
       // Register Signal K subscription stream
       const localSubscription = {
         context: "vessels.self",
-        subscribe: [{ path: "*", period: options.resolution || 200 }],
+        subscribe: [{ path: "*", period: options.resolution || 1000 }],
       };
 
       app.subscriptionmanager.subscribe(
@@ -230,8 +230,8 @@ module.exports = (app) => {
       let finalStatus = "Stopped";
       if (db) {
         const stats = getDatabaseStats();
-        if (stats.realCount > 0 || stats.boolCount > 0) {
-          finalStatus = `Stopped. Database: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics, ${stats.realCount + stats.boolCount} values stored${stats.timeRange ? ` (${stats.timeRange})` : ""}`;
+        if (stats.realCount > 0 || stats.boolCount > 0 || stats.stringCount > 0) {
+          finalStatus = `Stopped. Database: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics, ${stats.realCount + stats.boolCount + stats.stringCount} values stored${stats.timeRange ? ` (${stats.timeRange})` : ""}`;
         }
         db.close();
       }
