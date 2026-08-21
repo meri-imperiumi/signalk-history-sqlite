@@ -18,7 +18,7 @@
   "homepage": "https://github.com/meri-imperiumi/signalk-history-sqlite#readme",
   "keywords": [
     "signalk-node-server-plugin",
-    "signalk-category-history"
+    "signalk-category-database"
   ],
   "author": "Henri Bergius <henri.bergius@iki.fi>",
   "license": "EUPL-1.2",
@@ -29,6 +29,7 @@
     "index.js",
     "HistoryAPI.js",
     "icon.png",
+    "screenshot.png",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -37,7 +38,10 @@
   },
   "signalk": {
     "displayName": "SQLite History Provider",
-    "appIcon": "./icon.png"
+    "appIcon": "./icon.png",
+    "screenshots": [
+      "./screenshot.png"
+    ]
   },
   "dependencies": {}
 }
