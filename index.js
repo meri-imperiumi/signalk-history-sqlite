@@ -164,6 +164,9 @@ module.exports = (app) => {
       insertBoolStmt = db.prepare(
         "INSERT OR REPLACE INTO telemetry_bool (ts_ms, metric_id, value, source, context) VALUES (?, ?, ?, ?, ?)",
       );
+      insertStringStmt = db.prepare(
+        "INSERT OR REPLACE INTO telemetry_string (ts_ms, metric_id, value, source, context) VALUES (?, ?, ?, ?, ?)",
+      );
       getMetricStmt = db.prepare("SELECT id FROM metrics WHERE name = ?");
       insertMetricStmt = db.prepare(
         "INSERT INTO metrics (name) VALUES (?) RETURNING id",
@@ -326,7 +329,11 @@ module.exports = (app) => {
             params: [ts, metricId, value ? 1 : 0, source, context],
           });
         } else if (typeof value === "string") {
-          // Could store in string table, but for now skip
+          const metricId = getMetricId(valObj.path);
+          batchBuffer.push({
+            stmt: insertStringStmt,
+            params: [ts, metricId, value, source, context],
+          });
         } else if (value !== null && typeof value === "object") {
           // Special handling for navigation.position - store as separate latitude/longitude metrics
           if (
@@ -411,6 +418,9 @@ module.exports = (app) => {
       const boolCount = db
         .prepare("SELECT COUNT(*) as count FROM telemetry_bool")
         .get().count;
+      const stringCount = db
+        .prepare("SELECT COUNT(*) as count FROM telemetry_string")
+        .get().count;
 
       let dbSize = 0;
       try {
@@ -422,11 +432,16 @@ module.exports = (app) => {
 
       // Get time range of stored data
       let timeRange = null;
-      if (realCount > 0) {
+      if (realCount > 0 || stringCount > 0) {
+        // Use UNION to get time range from both real and string tables
         const range = db
-          .prepare(
-            "SELECT MIN(ts_ms) as min_ts, MAX(ts_ms) as max_ts FROM telemetry_real",
-          )
+          .prepare(`
+            SELECT MIN(ts_ms) as min_ts, MAX(ts_ms) as max_ts FROM (
+              SELECT ts_ms FROM telemetry_real
+              UNION ALL
+              SELECT ts_ms FROM telemetry_string
+            )
+          `)
           .get();
         if (range.min_ts && range.max_ts) {
           const days = Math.round(
@@ -436,12 +451,13 @@ module.exports = (app) => {
         }
       }
 
-      return { metricCount, realCount, boolCount, dbSize, timeRange };
+      return { metricCount, realCount, boolCount, stringCount, dbSize, timeRange };
     } catch (_err) {
       return {
         metricCount: 0,
         realCount: 0,
         boolCount: 0,
+        stringCount: 0,
         dbSize: 0,
         timeRange: null,
       };

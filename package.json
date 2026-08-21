@@ -28,8 +28,9 @@
   "files": [
     "index.js",
     "HistoryAPI.js",
-    "icon.svg",
-    "LICENSE"
+    "icon.png",
+    "README.md",
+    "CHANGELOG.md"
   ],
   "publishConfig": {
     "access": "public"
