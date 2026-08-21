@@ -584,7 +584,7 @@ class SQLiteHistoryProvider {
     });
 
     // Build IN clause placeholders
-    const inPlaceholders = uniquePaths.map(() => '?').join(', ');
+    const inPlaceholders = uniquePaths.map(() => "?").join(", ");
 
     // Build query with parameters
     let query;
@@ -612,12 +612,14 @@ class SQLiteHistoryProvider {
       `;
       // Build params: bucketSize (x2), pathSpec paths (for CASE), context, fromMs, toMs, uniquePaths (for IN), sourceRef
       params = [
-        bucketSize, bucketSize,
-        ...pathSpecs.map(ps => ps.path),
+        bucketSize,
+        bucketSize,
+        ...pathSpecs.map((ps) => ps.path),
         context,
-        fromMs, toMs,
+        fromMs,
+        toMs,
         ...uniquePaths,
-        sourceRef
+        sourceRef,
       ];
     } else {
       query = `
@@ -638,11 +640,13 @@ class SQLiteHistoryProvider {
         ORDER BY time ASC
       `;
       params = [
-        bucketSize, bucketSize,
-        ...pathSpecs.map(ps => ps.path),
+        bucketSize,
+        bucketSize,
+        ...pathSpecs.map((ps) => ps.path),
         context,
-        fromMs, toMs,
-        ...uniquePaths
+        fromMs,
+        toMs,
+        ...uniquePaths,
       ];
     }
 

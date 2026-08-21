@@ -233,7 +233,11 @@ module.exports = (app) => {
       let finalStatus = "Stopped";
       if (db) {
         const stats = getDatabaseStats();
-        if (stats.realCount > 0 || stats.boolCount > 0 || stats.stringCount > 0) {
+        if (
+          stats.realCount > 0 ||
+          stats.boolCount > 0 ||
+          stats.stringCount > 0
+        ) {
           finalStatus = `Stopped. Database: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics, ${stats.realCount + stats.boolCount + stats.stringCount} values stored${stats.timeRange ? ` (${stats.timeRange})` : ""}`;
         }
         db.close();
@@ -451,7 +455,14 @@ module.exports = (app) => {
         }
       }
 
-      return { metricCount, realCount, boolCount, stringCount, dbSize, timeRange };
+      return {
+        metricCount,
+        realCount,
+        boolCount,
+        stringCount,
+        dbSize,
+        timeRange,
+      };
     } catch (_err) {
       return {
         metricCount: 0,

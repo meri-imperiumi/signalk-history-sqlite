@@ -135,7 +135,9 @@ describe("String Telemetry Storage", () => {
       "INSERT OR REPLACE INTO telemetry_string (ts_ms, metric_id, value, source, context) VALUES (?, ?, ?, ?, ?)",
     );
 
-    const speedId = insertMetric.run("navigation.speedOverGround").lastInsertRowid;
+    const speedId = insertMetric.run(
+      "navigation.speedOverGround",
+    ).lastInsertRowid;
     const lightId = insertMetric.run("navigation.lights").lastInsertRowid;
     const modeId = insertMetric.run("autopilot.mode").lastInsertRowid;
 
