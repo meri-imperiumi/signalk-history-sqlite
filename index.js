@@ -22,6 +22,7 @@ module.exports = (app) => {
   let dbPath;
 
   const metricCache = new Map();
+  const lastWriteTime = new Map(); // Track last write time per (path, source, context)
   const selfContext = `vessels.${app.selfId}`;
 
   const plugin = {
@@ -311,10 +312,18 @@ module.exports = (app) => {
       const source = getSourceId(update);
       const date = update.timestamp ? new Date(update.timestamp) : new Date();
       const ts = date.getTime();
+      const resolution = options.resolution || 1000;
 
       for (const valObj of update.values) {
         // Check blacklist/whitelist
         if (!shouldStore(options, valObj.path)) {
+          continue;
+        }
+
+        // Check resolution - skip if not enough time has passed since last write for this metric
+        const metricKey = `${valObj.path}:${source}:${context}`;
+        const lastTs = lastWriteTime.get(metricKey);
+        if (lastTs !== undefined && ts - lastTs < resolution) {
           continue;
         }
 
@@ -326,18 +335,21 @@ module.exports = (app) => {
             stmt: insertRealStmt,
             params: [ts, metricId, value, source, context],
           });
+          lastWriteTime.set(metricKey, ts);
         } else if (typeof value === "boolean") {
           const metricId = getMetricId(valObj.path);
           batchBuffer.push({
             stmt: insertBoolStmt,
             params: [ts, metricId, value ? 1 : 0, source, context],
           });
+          lastWriteTime.set(metricKey, ts);
         } else if (typeof value === "string") {
           const metricId = getMetricId(valObj.path);
           batchBuffer.push({
             stmt: insertStringStmt,
             params: [ts, metricId, value, source, context],
           });
+          lastWriteTime.set(metricKey, ts);
         } else if (value !== null && typeof value === "object") {
           // Special handling for navigation.position - store as separate latitude/longitude metrics
           if (
@@ -364,6 +376,8 @@ module.exports = (app) => {
                 params: [ts, latMetricId, value.latitude, source, context],
               });
             }
+            // Track last write time for the parent position path
+            lastWriteTime.set(metricKey, ts);
           }
         }
 

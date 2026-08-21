@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Resolution is now actually applied instead of relying Signal K subscription to handle it
+
 ### Added
 - Screenshot of the plugin config screen
 
