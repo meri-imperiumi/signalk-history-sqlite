@@ -40,6 +40,24 @@ describe("SQLiteHistoryProvider", () => {
           context TEXT,
           PRIMARY KEY (ts_ms, metric_id, source)
       ) STRICT, WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS telemetry_string (
+          ts_ms INTEGER NOT NULL,
+          metric_id INTEGER NOT NULL,
+          value TEXT NOT NULL,
+          source TEXT,
+          context TEXT,
+          PRIMARY KEY (ts_ms, metric_id, source)
+      ) STRICT, WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS telemetry_json (
+          ts_ms INTEGER NOT NULL,
+          metric_id INTEGER NOT NULL,
+          value TEXT NOT NULL,
+          source TEXT,
+          context TEXT,
+          PRIMARY KEY (ts_ms, metric_id, source)
+      ) STRICT, WITHOUT ROWID;
     `);
 
     provider = new SQLiteHistoryProvider(
@@ -247,6 +265,24 @@ describe("Database Schema", () => {
           context TEXT,
           PRIMARY KEY (ts_ms, metric_id, source)
       ) STRICT, WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS telemetry_string (
+          ts_ms INTEGER NOT NULL,
+          metric_id INTEGER NOT NULL,
+          value TEXT NOT NULL,
+          source TEXT,
+          context TEXT,
+          PRIMARY KEY (ts_ms, metric_id, source)
+      ) STRICT, WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS telemetry_json (
+          ts_ms INTEGER NOT NULL,
+          metric_id INTEGER NOT NULL,
+          value TEXT NOT NULL,
+          source TEXT,
+          context TEXT,
+          PRIMARY KEY (ts_ms, metric_id, source)
+      ) STRICT, WITHOUT ROWID;
     `);
 
     const tables = db
@@ -257,6 +293,8 @@ describe("Database Schema", () => {
     assert.ok(tableNames.includes("metrics"));
     assert.ok(tableNames.includes("telemetry_real"));
     assert.ok(tableNames.includes("telemetry_bool"));
+    assert.ok(tableNames.includes("telemetry_string"));
+    assert.ok(tableNames.includes("telemetry_json"));
 
     db.close();
     fs.unlinkSync(dbPath);

@@ -394,6 +394,108 @@ describe("Plugin", () => {
     });
   });
 
+  test("should store JSON object values in telemetry_json", () => {
+    plugin = pluginModule(app);
+    plugin.start({
+      batchSize: 10,
+      batchWriteInterval: 1,
+      resolution: 200,
+    });
+
+    const deltaHandlers = app.getDeltaHandlers();
+    const handler = deltaHandlers[0];
+
+    const payload = {
+      state: "alert",
+      message: "low battery",
+      method: ["sound"],
+    };
+    handler({
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: new Date().toISOString(),
+          $source: "test.source",
+          values: [{ path: "notifications.mobility", value: payload }],
+        },
+      ],
+    });
+
+    return new Promise((resolve) => setTimeout(resolve, 1500)).then(() => {
+      const dbPath = path.join(testDataDir, "sqlite-history", "telemetry.db");
+      const db = new DatabaseSync(dbPath);
+
+      const metrics = db.prepare("SELECT name FROM metrics").all();
+      const metricNames = metrics.map((m) => m.name);
+      assert.ok(metricNames.includes("notifications.mobility"));
+
+      const rows = db
+        .prepare("SELECT COUNT(*) as count FROM telemetry_json")
+        .get();
+      assert.ok(rows.count >= 1);
+
+      const row = db
+        .prepare(
+          "SELECT value FROM telemetry_json t JOIN metrics m ON t.metric_id = m.id WHERE m.name = ? LIMIT 1",
+        )
+        .get("notifications.mobility");
+      assert.ok(row);
+      assert.deepStrictEqual(JSON.parse(row.value), payload);
+
+      db.close();
+    });
+  });
+
+  test("should serve JSON object values through the History API", () => {
+    plugin = pluginModule(app);
+    plugin.start({
+      batchSize: 10,
+      batchWriteInterval: 1,
+      resolution: 200,
+    });
+
+    const deltaHandlers = app.getDeltaHandlers();
+    const handler = deltaHandlers[0];
+
+    const payload = { state: "normal", message: "all good" };
+    handler({
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: new Date().toISOString(),
+          $source: "test.source",
+          values: [{ path: "notifications.mobility", value: payload }],
+        },
+      ],
+    });
+
+    return new Promise((resolve) => setTimeout(resolve, 1500)).then(
+      async () => {
+        const provider = app.historyProvider;
+        assert.ok(provider);
+
+        const result = await provider.getValues({
+          from: new Date(Date.now() - 60_000).toISOString(),
+          to: new Date(Date.now() + 60_000).toISOString(),
+          context: "vessels.self",
+          resolution: 60,
+          pathSpecs: [
+            {
+              path: "notifications.mobility",
+              aggregate: "first",
+              parameter: [],
+            },
+          ],
+        });
+
+        assert.ok(result.data.length >= 1);
+        const row = result.data.find((r) => r[1] !== null);
+        assert.ok(row, "expected a non-null row");
+        assert.deepStrictEqual(row[1], payload);
+      },
+    );
+  });
+
   test("should register history provider", () => {
     plugin = pluginModule(app);
     plugin.start({

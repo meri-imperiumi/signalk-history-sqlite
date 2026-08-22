@@ -1,12 +1,34 @@
 const DEFAULT_EMA_PERIOD = 5;
 
-// Maps the History API aggregation methods to SQLite aggregate functions.
+// The telemetry tables the writer stores each value type in. Numeric values
+// go into `telemetry_real`, booleans into `telemetry_bool`, strings into
+// `telemetry_string` and other objects (notifications, rich values) into
+// `telemetry_json` (stored as a JSON-encoded TEXT string). This mirrors the
+// v1 influxdb writer's `value`/`boolValue`/`stringValue`/`jsonValue` fields.
+const TABLE_FOR_TYPE = {
+  real: "telemetry_real",
+  bool: "telemetry_bool",
+  string: "telemetry_string",
+  json: "telemetry_json",
+};
+
+// SQLite aggregate functions that are meaningful for each value type. Only
+// `first`/`last` (chronological) make sense for strings, booleans and JSON
+// objects; average/min/max and the moving-average methods require numbers. Any
+// other method is coerced to `first` for those types, matching how
+// navigation.position and the influxdb provider are handled.
+
+// Maps the History API aggregation methods to SQLite aggregate functions for
+// numeric (`telemetry_real`) values. `first`/`last` are chronological (picked
+// by timestamp within each time bucket, not by value) and handled specially in
+// the query builder. `sma`/`ema` are computed in post-processing on top of
+// `avg` buckets, matching the signalk-to-influxdb implementation.
 const functionForAggregate = {
   average: "avg",
   min: "min",
   max: "max",
-  first: "min",
-  last: "max",
+  first: "first",
+  last: "last",
   sma: "avg",
   ema: "avg",
   mid: "avg",
@@ -64,10 +86,69 @@ function resolveEmaParams(spec) {
 }
 
 /**
+ * Returns true when a path stores its values in the numeric `telemetry_real`
+ * table (or has not been discovered yet, in which case we assume numeric).
+ * @param {Object} spec - Path specification with a discovered `type`
+ * @returns {boolean}
+ */
+function isNumericType(spec) {
+  return spec.type === undefined || spec.type === "real";
+}
+
+/**
+ * Returns the SQLite aggregate function to use for a path spec, taking its
+ * discovered value type into account. Numeric specs keep the requested
+ * aggregation (mapped via `functionForAggregate`); non-numeric specs only
+ * support `first`/`last` and any other method is coerced to `first`.
+ * @param {Object} spec - Path specification with `aggregateMethod` and `type`
+ * @returns {string} SQLite aggregate function name
+ */
+function aggregateFunctionFor(spec) {
+  if (isNumericType(spec)) {
+    return functionForAggregate[spec.aggregateMethod] || "avg";
+  }
+  const mapped = functionForAggregate[spec.aggregateMethod];
+  return mapped === "first" || mapped === "last" ? mapped : "first";
+}
+
+/**
+ * Decode a raw cell value read from a telemetry table according to the value
+ * type. `telemetry_json` stores JSON-encoded objects as TEXT; parse them back
+ * into the original value. Booleans are stored as 0/1 INTEGERs and converted
+ * back to real booleans. Everything else is returned as-is.
+ * @param {any} raw - Raw value from the database
+ * @param {string} [type] - Discovered value type
+ * @returns {any} Decoded value
+ */
+function decodeValue(raw, type) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (type === "bool") {
+    return raw === 1 || raw === true;
+  }
+  if (type === "json" && typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch (_e) {
+      return raw;
+    }
+  }
+  return raw;
+}
+
+/**
  * History API provider backed by SQLite.
  *
  * Implements the Signal K History API so that the server can serve
  * `/signalk/v2/api/history/*` from data stored in SQLite by this plugin.
+ *
+ * The writer stores each Signal K value in a typed telemetry table:
+ * `telemetry_real` (numbers), `telemetry_bool` (booleans),
+ * `telemetry_string` (strings) and `telemetry_json` (objects, JSON-encoded).
+ * This provider discovers which table each requested path lives in, coerces
+ * the aggregation method to one valid for that value type (only `first`/`last`
+ * are meaningful for non-numeric values) and queries the appropriate table.
  *
  * @class SQLiteHistoryProvider
  */
@@ -82,6 +163,92 @@ class SQLiteHistoryProvider {
     this.db = db;
     this.selfId = selfId;
     this.debug = debug;
+    // Cache of path -> value type ('real' | 'bool' | 'string' | 'json'),
+    // populated lazily by inspecting which telemetry table holds the path's
+    // metric_id. Mirrors the influxdb provider's fieldCache.
+    this.typeCache = new Map();
+  }
+
+  /**
+   * Discover which telemetry table each non-position path stores its values
+   * in, cache the result and rewrite each path spec's `aggregateFunction` to a
+   * selector valid for that type. Numeric (`telemetry_real`) specs keep the
+   * requested aggregation; non-numeric specs are restricted to `first`/`last`
+   * and any other method is coerced to `first`.
+   * @private
+   * @param {Array<Object>} pathSpecs - Path specifications to resolve
+   * @returns {Promise<void>}
+   */
+  async resolveTypes(pathSpecs) {
+    const uniquePaths = Array.from(
+      new Set(
+        pathSpecs
+          .filter(({ path }) => path !== "navigation.position")
+          .map(({ path }) => path),
+      ),
+    );
+    if (uniquePaths.length === 0) {
+      return;
+    }
+    await Promise.all(
+      uniquePaths.map(async (path) => {
+        const type = await this.discoverType(path);
+        pathSpecs.forEach((spec) => {
+          if (spec.path === path && spec.path !== "navigation.position") {
+            spec.type = type;
+            spec.aggregateFunction = aggregateFunctionFor(spec);
+          }
+        });
+      }),
+    );
+  }
+
+  /**
+   * Returns the value type a path stores its values as, by looking up the
+   * path's metric_id and checking which telemetry table contains rows for
+   * it. The result is cached per path. When no data has been stored yet (the
+   * metric does not exist or no telemetry rows are found) the numeric
+   * `real` default is assumed, matching the historic behaviour.
+   * @private
+   * @param {string} path - Signal K path
+   * @returns {Promise<string>} One of 'real', 'bool', 'string', 'json'
+   */
+  async discoverType(path) {
+    const cached = this.typeCache.get(path);
+    if (cached) {
+      return cached;
+    }
+    let type = "real";
+    try {
+      const metric = this.db
+        .prepare("SELECT id FROM metrics WHERE name = ?")
+        .get(path);
+      if (metric) {
+        const metricId = metric.id;
+        // Check each telemetry table for rows belonging to this metric. A
+        // missing table (e.g. an older database without telemetry_json) is
+        // skipped rather than aborting the whole lookup.
+        for (const t of ["bool", "string", "json", "real"]) {
+          const table = TABLE_FOR_TYPE[t];
+          try {
+            const row = this.db
+              .prepare(`SELECT 1 FROM ${table} WHERE metric_id = ? LIMIT 1`)
+              .get(metricId);
+            if (row) {
+              type = t;
+              break;
+            }
+          } catch (_e) {
+            // Table does not exist in this database; assume the metric has no
+            // values of this type and continue.
+          }
+        }
+      }
+    } catch (e) {
+      this.debug(`discoverType failed for ${path}: ${e.message}`);
+    }
+    this.typeCache.set(path, type);
+    return type;
   }
 
   /**
@@ -116,6 +283,12 @@ class SQLiteHistoryProvider {
       };
     });
 
+    // Discover which telemetry table each non-position path stores its values
+    // in, then adjust the aggregate function accordingly: only `first`/`last`
+    // are meaningful for textual, boolean and JSON values, so any numeric-only
+    // method is coerced to `first` for those types.
+    await this.resolveTypes(pathSpecs);
+
     const positionPathSpecs = pathSpecs
       .filter(({ path }) => path === "navigation.position")
       .slice(0, 1);
@@ -125,9 +298,10 @@ class SQLiteHistoryProvider {
     const needsCollation =
       nonPositionPathSpecs.length > 0 && positionPathSpecs.length > 0;
 
-    // Calculate extended query window for SMA and EMA.
+    // Calculate extended query window for SMA and EMA. Only numeric fields
+    // support moving averages; non-numeric specs were coerced to `first`.
     const maxSmaWindow = nonPositionPathSpecs.reduce((max, spec) => {
-      if (spec.aggregateMethod === "sma") {
+      if (spec.aggregateMethod === "sma" && isNumericType(spec)) {
         const windowSize =
           spec.parameters.length > 0 ? parseInt(spec.parameters[0], 10) : 5;
         return Math.max(max, windowSize);
@@ -136,7 +310,7 @@ class SQLiteHistoryProvider {
     }, 0);
 
     const maxEmaWindow = nonPositionPathSpecs.reduce((max, spec) => {
-      if (spec.aggregateMethod === "ema") {
+      if (spec.aggregateMethod === "ema" && isNumericType(spec)) {
         const { period } = resolveEmaParams(spec);
         return Math.max(max, Math.ceil(period * 4));
       }
@@ -301,18 +475,21 @@ class SQLiteHistoryProvider {
     const fromMs = from.getTime();
     const toMs = to.getTime();
 
-    const result = this.db
-      .prepare(`
-      SELECT DISTINCT context
-      FROM telemetry_real
-      WHERE ts_ms >= ? AND ts_ms <= ?
-      UNION
-      SELECT DISTINCT context
-      FROM telemetry_bool
-      WHERE ts_ms >= ? AND ts_ms <= ?
-    `)
-      .all(fromMs, toMs, fromMs, toMs);
-
+    const tables = this.existingTelemetryTables();
+    if (tables.length === 0) {
+      return [];
+    }
+    const selects = tables
+      .map(
+        (t) =>
+          `SELECT DISTINCT context FROM ${t} WHERE ts_ms >= ? AND ts_ms <= ?`,
+      )
+      .join(" UNION ");
+    const params = [];
+    for (let i = 0; i < tables.length; i++) {
+      params.push(fromMs, toMs);
+    }
+    const result = this.db.prepare(selects).all(...params);
     return result.map((row) => row.context);
   }
 
@@ -326,24 +503,49 @@ class SQLiteHistoryProvider {
     const fromMs = from.getTime();
     const toMs = to.getTime();
 
+    const tables = this.existingTelemetryTables();
+    if (tables.length === 0) {
+      return [];
+    }
+    const existsClauses = tables
+      .map(
+        (t) =>
+          `EXISTS (SELECT 1 FROM ${t} x WHERE x.metric_id = m.id AND x.ts_ms >= ? AND x.ts_ms <= ?)`,
+      )
+      .join(" OR ");
+    const params = [];
+    for (let i = 0; i < tables.length; i++) {
+      params.push(fromMs, toMs);
+    }
     const result = this.db
       .prepare(`
-      SELECT DISTINCT m.name
-      FROM metrics m
-      WHERE EXISTS (
-        SELECT 1 FROM telemetry_real t
-        WHERE t.metric_id = m.id
-        AND t.ts_ms >= ? AND t.ts_ms <= ?
-      )
-      OR EXISTS (
-        SELECT 1 FROM telemetry_bool t
-        WHERE t.metric_id = m.id
-        AND t.ts_ms >= ? AND t.ts_ms <= ?
-      )
-    `)
-      .all(fromMs, toMs, fromMs, toMs);
+        SELECT DISTINCT m.name
+        FROM metrics m
+        WHERE ${existsClauses}
+      `)
+      .all(...params);
 
     return result.map((row) => row.name);
+  }
+
+  /**
+   * Returns the subset of telemetry tables that exist in this database, so
+   * `getContexts`/`getPaths` degrade gracefully on databases created before
+   * all typed tables were introduced.
+   * @private
+   * @returns {string[]} Existing telemetry table names
+   */
+  existingTelemetryTables() {
+    if (this._existingTables) {
+      return this._existingTables;
+    }
+    const rows = this.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'telemetry_%'",
+      )
+      .all();
+    this._existingTables = rows.map((r) => r.name);
+    return this._existingTables;
   }
 
   /**
@@ -375,7 +577,7 @@ class SQLiteHistoryProvider {
     if (sourceRef) {
       query = `
         SELECT
-          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          datetime((t.ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER) / 1000, 'unixepoch') AS time,
           MIN(CASE WHEN m.name = 'navigation.position.longitude' THEN t.value END) AS longitude,
           MIN(CASE WHEN m.name = 'navigation.position.latitude' THEN t.value END) AS latitude
         FROM telemetry_real t
@@ -397,7 +599,7 @@ class SQLiteHistoryProvider {
     } else {
       query = `
         SELECT
-          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          datetime((t.ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER) / 1000, 'unixepoch') AS time,
           MIN(CASE WHEN m.name = 'navigation.position.longitude' THEN t.value END) AS longitude,
           MIN(CASE WHEN m.name = 'navigation.position.latitude' THEN t.value END) AS latitude
         FROM telemetry_real t
@@ -438,7 +640,7 @@ class SQLiteHistoryProvider {
   }
 
   /**
-   * Get numeric values for specified paths
+   * Get values for specified non-position paths
    * @private
    * @param {string} context - Signal K context
    * @param {Date} from - Start time
@@ -456,13 +658,11 @@ class SQLiteHistoryProvider {
     pathSpecs,
     needsCollation,
   ) {
-    const _fromMs = from.getTime();
-    const _toMs = to.getTime();
-
     const distinctSourceRefs = new Set(pathSpecs.map((ps) => ps.sourceRef));
 
     // Common case: all paths share a single source (or none). A single query
-    // suffices and the result layout is identical to the unfiltered behaviour.
+    // group suffices and the result layout is identical to the unfiltered
+    // behaviour.
     if (distinctSourceRefs.size <= 1) {
       const sourceRef = pathSpecs[0]?.sourceRef;
       return this.querySourceGroup(
@@ -476,7 +676,7 @@ class SQLiteHistoryProvider {
       );
     }
 
-    // Mixed sources: each distinct sourceRef needs its own query.
+    // Mixed sources: each distinct sourceRef needs its own query group.
     const groups = new Map();
     pathSpecs.forEach((ps, i) => {
       let group = groups.get(ps.sourceRef);
@@ -556,6 +756,50 @@ class SQLiteHistoryProvider {
     _needsCollation,
     sourceRef,
   ) {
+    // When every spec reads the numeric `telemetry_real` table AND none needs
+    // chronological first/last (which SQLite has no aggregate for) we can use a
+    // single grouped query (the original, fast path). Otherwise we run one
+    // query per path and collate the results by timestamp, since each value
+    // type lives in its own table and first/last need a window-function
+    // subquery.
+    const allNumeric = pathSpecs.every((ps) => isNumericType(ps));
+    const needsChronological = pathSpecs.some(
+      (ps) =>
+        ps.aggregateFunction === "first" || ps.aggregateFunction === "last",
+    );
+    if (!allNumeric || needsChronological) {
+      return this.querySourceGroupPerPath(
+        context,
+        from,
+        to,
+        timeResolutionMillis,
+        pathSpecs,
+        sourceRef,
+      );
+    }
+    return this.queryNumericGroup(
+      context,
+      from,
+      to,
+      timeResolutionMillis,
+      pathSpecs,
+      sourceRef,
+    );
+  }
+
+  /**
+   * Run a single grouped query against `telemetry_real` for path specs that
+   * all read numeric values. This is the original fast path.
+   * @private
+   */
+  async queryNumericGroup(
+    context,
+    from,
+    to,
+    timeResolutionMillis,
+    pathSpecs,
+    sourceRef,
+  ) {
     const start = Date.now();
     const fromMs = from.getTime();
     const toMs = to.getTime();
@@ -566,34 +810,28 @@ class SQLiteHistoryProvider {
       }
       return acc;
     }, []);
-    const _uniqueAggregates = pathSpecs.reduce((acc, ps) => {
-      if (acc.indexOf(ps.aggregateFunction) === -1) {
-        acc.push(ps.aggregateFunction);
-      }
-      return acc;
-    }, []);
 
     const bucketSize = Math.floor(timeResolutionMillis);
 
-    // Build CASE statements with parameterized paths
+    // Build CASE statements with parameterized paths. The fast path only
+    // handles the plain SQLite aggregates (avg/min/max); chronological
+    // first/last are routed to the per-path query path.
     const selectClauses = [];
     pathSpecs.forEach((ps, idx) => {
       selectClauses.push(
-        `${ps.aggregateFunction}(CASE WHEN m.name = ? THEN t.value END) AS "col_${idx}"`,
+        `${ps.aggregateFunction.toUpperCase()}(CASE WHEN m.name = ? THEN t.value END) AS "col_${idx}"`,
       );
     });
 
-    // Build IN clause placeholders
     const inPlaceholders = uniquePaths.map(() => "?").join(", ");
 
-    // Build query with parameters
     let query;
     let params;
 
     if (sourceRef) {
       query = `
         SELECT
-          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          datetime((t.ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER) / 1000, 'unixepoch') AS time,
           ${selectClauses.join(",\n        ")}
         FROM telemetry_real t
         JOIN metrics m ON t.metric_id = m.id
@@ -610,7 +848,6 @@ class SQLiteHistoryProvider {
         GROUP BY time
         ORDER BY time ASC
       `;
-      // Build params: bucketSize (x2), pathSpec paths (for CASE), context, fromMs, toMs, uniquePaths (for IN), sourceRef
       params = [
         bucketSize,
         bucketSize,
@@ -624,7 +861,7 @@ class SQLiteHistoryProvider {
     } else {
       query = `
         SELECT
-          datetime((t.ts_ms / ?) * ? / 1000, 'unixepoch') AS time,
+          datetime((t.ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER) / 1000, 'unixepoch') AS time,
           ${selectClauses.join(",\n        ")}
         FROM telemetry_real t
         JOIN metrics m ON t.metric_id = m.id
@@ -670,6 +907,210 @@ class SQLiteHistoryProvider {
       data: resultData,
     };
   }
+
+  /**
+   * Run one query per path (against the path's own telemetry table) and
+   * collate the results by timestamp into the original column order of
+   * `pathSpecs`. Used when one or more specs read a non-numeric table, since
+   * each value type lives in its own table and needs type-specific decoding.
+   *
+   * `first`/`last` are chronological (picked by timestamp within each time
+   * bucket); the numeric aggregates `avg`/`min`/`max` map to SQLite functions
+   * over the bucket. Duplicate specs (same path+type+aggregate) collapse into
+   * a single query whose value fans out to every output column it feeds.
+   * @private
+   */
+  async querySourceGroupPerPath(
+    context,
+    from,
+    to,
+    timeResolutionMillis,
+    pathSpecs,
+    sourceRef,
+  ) {
+    const fromMs = from.getTime();
+    const toMs = to.getTime();
+    const bucketSize = Math.floor(timeResolutionMillis);
+
+    // Collapse duplicate specs into a single query, remembering which output
+    // columns each query feeds so we can fan values out.
+    const perPath = new Map();
+    pathSpecs.forEach((ps, i) => {
+      const key = `${ps.path}|${ps.type}|${ps.aggregateFunction}`;
+      let entry = perPath.get(key);
+      if (!entry) {
+        entry = { spec: ps, indices: [] };
+        perPath.set(key, entry);
+      }
+      entry.indices.push(i);
+    });
+
+    const queryPromises = Array.from(perPath.values()).map(
+      ({ spec, indices }) =>
+        this.querySinglePath(
+          context,
+          fromMs,
+          toMs,
+          bucketSize,
+          spec,
+          sourceRef,
+        ).then((rows) => ({ spec, indices, rows })),
+    );
+
+    const results = await Promise.all(queryPromises);
+
+    const tsSet = new Set();
+    results.forEach(({ rows }) => {
+      rows.forEach((r) => {
+        tsSet.add(toIso(r.time));
+      });
+    });
+    const allTs = Array.from(tsSet).sort();
+    const rowByTs = new Map();
+    allTs.forEach((ts) => {
+      const row = new Array(pathSpecs.length + 1).fill(null);
+      row[0] = ts;
+      rowByTs.set(ts, row);
+    });
+
+    results.forEach(({ spec, indices, rows }) => {
+      rows.forEach((row) => {
+        const ts = toIso(row.time);
+        const target = rowByTs.get(ts);
+        if (!target) {
+          return;
+        }
+        const decoded = decodeValue(row.value, spec.type);
+        indices.forEach((originalIndex) => {
+          target[originalIndex + 1] = decoded;
+        });
+      });
+    });
+
+    return {
+      values: valuesForSpecs(pathSpecs),
+      data: allTs.map((ts) => rowByTs.get(ts)),
+    };
+  }
+
+  /**
+   * Run a single bucketed query for one path against its telemetry table,
+   * returning rows of `{ time, value }` where `time` is an ISO timestamp and
+   * `value` is the raw (undecoded) aggregated cell value.
+   * @private
+   * @param {string} context - Signal K context
+   * @param {number} fromMs - Start time in epoch milliseconds
+   * @param {number} toMs - End time in epoch milliseconds
+   * @param {number} bucketSize - Bucket size in milliseconds
+   * @param {Object} spec - Resolved path spec with `path`, `type`, `aggregateFunction`
+   * @param {string} [sourceRef] - Optional source reference filter
+   * @returns {Promise<Array<{time: string, value: any}>>} Bucketed rows
+   */
+  async querySinglePath(context, fromMs, toMs, bucketSize, spec, sourceRef) {
+    const table = TABLE_FOR_TYPE[spec.type] || TABLE_FOR_TYPE.real;
+    const fn = spec.aggregateFunction;
+    const metricId = this.metricIdFor(spec.path);
+
+    if (fn === "first" || fn === "last") {
+      // Chronological first/last: pick the value of the row with the
+      // smallest/largest ts_ms within each time bucket using a window
+      // function, then collapse to one row per bucket. SQLite has no
+      // FIRST()/LAST() aggregate, so we rank rows within each bucket by
+      // ts_ms and select the value where the rank is 1.
+      const order = fn === "first" ? "ASC" : "DESC";
+      const query = `
+        SELECT datetime(bucket_ms / 1000, 'unixepoch') AS time,
+               MAX(CASE WHEN rn = 1 THEN value END) AS value
+        FROM (
+          SELECT
+            (ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER) AS bucket_ms,
+            value,
+            ROW_NUMBER() OVER (
+              PARTITION BY (ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER)
+              ORDER BY ts_ms ${order}
+            ) AS rn
+          FROM ${table}
+          WHERE context = ?
+            AND ts_ms >= ?
+            AND ts_ms <= ?
+            AND metric_id = ?
+            ${sourceRef ? "AND source = ?" : ""}
+        )
+        GROUP BY bucket_ms
+        ORDER BY time ASC
+      `;
+      const params = sourceRef
+        ? [
+            bucketSize,
+            bucketSize,
+            bucketSize,
+            bucketSize,
+            context,
+            fromMs,
+            toMs,
+            metricId,
+            sourceRef,
+          ]
+        : [
+            bucketSize,
+            bucketSize,
+            bucketSize,
+            bucketSize,
+            context,
+            fromMs,
+            toMs,
+            metricId,
+          ];
+      this.debug(query);
+      return this.db.prepare(query).all(...params);
+    }
+
+    // Plain aggregate (avg/min/max) over the bucket.
+    const query = `
+      SELECT
+        datetime((t.ts_ms / CAST(? AS INTEGER)) * CAST(? AS INTEGER) / 1000, 'unixepoch') AS time,
+        ${fn.toUpperCase()}(t.value) AS value
+      FROM ${table} t
+      WHERE
+        t.context = ?
+        AND
+        t.ts_ms >= ?
+        AND
+        t.ts_ms <= ?
+        AND
+        t.metric_id = ?
+        ${sourceRef ? "AND t.source = ?" : ""}
+      GROUP BY time
+      ORDER BY time ASC
+    `;
+    const params = sourceRef
+      ? [bucketSize, bucketSize, context, fromMs, toMs, metricId, sourceRef]
+      : [bucketSize, bucketSize, context, fromMs, toMs, metricId];
+    this.debug(query);
+    return this.db.prepare(query).all(...params);
+  }
+
+  /**
+   * Resolve a path to its metric_id, caching the result. Returns the id or
+   * undefined if the path has no metric row (no data stored yet).
+   * @private
+   * @param {string} path - Signal K path
+   * @returns {number|undefined} metric id
+   */
+  metricIdFor(path) {
+    if (this._metricIdCache?.has(path)) {
+      return this._metricIdCache.get(path);
+    }
+    const row = this.db
+      .prepare("SELECT id FROM metrics WHERE name = ?")
+      .get(path);
+    const id = row ? row.id : undefined;
+    if (!this._metricIdCache) {
+      this._metricIdCache = new Map();
+    }
+    this._metricIdCache.set(path, id);
+    return id;
+  }
 }
 
 /**
@@ -710,7 +1151,9 @@ function getTimeRange(query) {
 }
 
 /**
- * Apply SMA and EMA post-processing to result data
+ * Apply SMA and EMA post-processing to result data. Non-numeric specs (which
+ * were coerced to `first`) are skipped; only numeric SMA/EMA columns are
+ * processed.
  *
  * @param {Object} result - Data result with values and data
  * @param {Array<Object>} pathSpecs - Path specifications
@@ -726,10 +1169,14 @@ function applyMovingAveragePostProcessing(
 
   const smaIndices = pathSpecs
     .map((spec, idx) => ({ spec, idx }))
-    .filter(({ spec }) => spec.aggregateMethod === "sma");
+    .filter(
+      ({ spec }) => spec.aggregateMethod === "sma" && isNumericType(spec),
+    );
   const emaIndices = pathSpecs
     .map((spec, idx) => ({ spec, idx }))
-    .filter(({ spec }) => spec.aggregateMethod === "ema");
+    .filter(
+      ({ spec }) => spec.aggregateMethod === "ema" && isNumericType(spec),
+    );
 
   if (smaIndices.length === 0 && emaIndices.length === 0) {
     const requestedFromMs = new Date(requestedFromTimestamp).toISOString();
@@ -834,6 +1281,17 @@ function applyMovingAveragePostProcessing(
     values: result.values,
     data: trimmedData,
   };
+}
+
+/**
+ * Convert a SQLite `datetime(...)` text result (`YYYY-MM-DD HH:MM:SS`, in
+ * UTC) into an ISO-8601 timestamp string, matching the format the fast path
+ * produces via `new Date(...).toISOString()`.
+ * @param {string} time - Raw SQLite datetime text
+ * @returns {string} ISO timestamp
+ */
+function toIso(time) {
+  return new Date(`${time}Z`).toISOString();
 }
 
 module.exports = { SQLiteHistoryProvider };

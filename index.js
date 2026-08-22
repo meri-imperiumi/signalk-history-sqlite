@@ -156,6 +156,15 @@ module.exports = (app) => {
         CREATE INDEX IF NOT EXISTS idx_telemetry_real_ts ON telemetry_real(ts_ms);
         CREATE INDEX IF NOT EXISTS idx_telemetry_real_metric ON telemetry_real(metric_id);
         CREATE INDEX IF NOT EXISTS idx_telemetry_real_context ON telemetry_real(context);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_bool_ts ON telemetry_bool(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_bool_metric ON telemetry_bool(metric_id);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_bool_context ON telemetry_bool(context);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_string_ts ON telemetry_string(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_string_metric ON telemetry_string(metric_id);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_string_context ON telemetry_string(context);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_json_ts ON telemetry_json(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_json_metric ON telemetry_json(metric_id);
+        CREATE INDEX IF NOT EXISTS idx_telemetry_json_context ON telemetry_json(context);
       `);
 
       // Prepare statements
@@ -167,6 +176,9 @@ module.exports = (app) => {
       );
       insertStringStmt = db.prepare(
         "INSERT OR REPLACE INTO telemetry_string (ts_ms, metric_id, value, source, context) VALUES (?, ?, ?, ?, ?)",
+      );
+      insertJsonStmt = db.prepare(
+        "INSERT OR REPLACE INTO telemetry_json (ts_ms, metric_id, value, source, context) VALUES (?, ?, ?, ?, ?)",
       );
       getMetricStmt = db.prepare("SELECT id FROM metrics WHERE name = ?");
       insertMetricStmt = db.prepare(
@@ -194,7 +206,7 @@ module.exports = (app) => {
       // Get initial database stats
       const initialStats = getDatabaseStats();
       setStatus(
-        `Ready. Database: ${formatBytes(initialStats.dbSize)}, ${initialStats.metricCount} metrics, ${initialStats.realCount} real, ${initialStats.boolCount} bool, ${initialStats.stringCount} string values${initialStats.timeRange ? ` (${initialStats.timeRange})` : ""}`,
+        `Ready. Database: ${formatBytes(initialStats.dbSize)}, ${initialStats.metricCount} metrics, ${initialStats.realCount} real, ${initialStats.boolCount} bool, ${initialStats.stringCount} string, ${initialStats.jsonCount} json values${initialStats.timeRange ? ` (${initialStats.timeRange})` : ""}`,
       );
 
       // Register Signal K subscription stream
@@ -237,9 +249,10 @@ module.exports = (app) => {
         if (
           stats.realCount > 0 ||
           stats.boolCount > 0 ||
-          stats.stringCount > 0
+          stats.stringCount > 0 ||
+          stats.jsonCount > 0
         ) {
-          finalStatus = `Stopped. Database: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics, ${stats.realCount + stats.boolCount + stats.stringCount} values stored${stats.timeRange ? ` (${stats.timeRange})` : ""}`;
+          finalStatus = `Stopped. Database: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics, ${stats.realCount + stats.boolCount + stats.stringCount + stats.jsonCount} values stored${stats.timeRange ? ` (${stats.timeRange})` : ""}`;
         }
         db.close();
       }
@@ -378,6 +391,26 @@ module.exports = (app) => {
             }
             // Track last write time for the parent position path
             lastWriteTime.set(metricKey, ts);
+          } else if (valObj.path !== "navigation.position") {
+            // Store other objects (notifications, rich values) as JSON-encoded
+            // text in telemetry_json, mirroring the v1 influxdb writer's
+            // jsonValue field. navigation.position is only ever stored as
+            // split lon/lat real values above (when track recording is on),
+            // so skip it here to avoid a duplicate representation.
+            let serialized;
+            try {
+              serialized = JSON.stringify(value);
+            } catch (_e) {
+              serialized = null;
+            }
+            if (serialized !== null) {
+              const metricId = getMetricId(valObj.path);
+              batchBuffer.push({
+                stmt: insertJsonStmt,
+                params: [ts, metricId, serialized, source, context],
+              });
+              lastWriteTime.set(metricKey, ts);
+            }
           }
         }
 
@@ -439,6 +472,9 @@ module.exports = (app) => {
       const stringCount = db
         .prepare("SELECT COUNT(*) as count FROM telemetry_string")
         .get().count;
+      const jsonCount = db
+        .prepare("SELECT COUNT(*) as count FROM telemetry_json")
+        .get().count;
 
       let dbSize = 0;
       try {
@@ -450,14 +486,18 @@ module.exports = (app) => {
 
       // Get time range of stored data
       let timeRange = null;
-      if (realCount > 0 || stringCount > 0) {
-        // Use UNION to get time range from both real and string tables
+      if (realCount > 0 || stringCount > 0 || jsonCount > 0 || boolCount > 0) {
+        // Use UNION ALL to get time range across all telemetry tables
         const range = db
           .prepare(`
             SELECT MIN(ts_ms) as min_ts, MAX(ts_ms) as max_ts FROM (
               SELECT ts_ms FROM telemetry_real
               UNION ALL
+              SELECT ts_ms FROM telemetry_bool
+              UNION ALL
               SELECT ts_ms FROM telemetry_string
+              UNION ALL
+              SELECT ts_ms FROM telemetry_json
             )
           `)
           .get();
@@ -474,6 +514,7 @@ module.exports = (app) => {
         realCount,
         boolCount,
         stringCount,
+        jsonCount,
         dbSize,
         timeRange,
       };
@@ -483,6 +524,7 @@ module.exports = (app) => {
         realCount: 0,
         boolCount: 0,
         stringCount: 0,
+        jsonCount: 0,
         dbSize: 0,
         timeRange: null,
       };
