@@ -446,6 +446,55 @@ describe("SQLiteHistoryProvider non-numeric values", () => {
     }
   });
 
+  test("getValues with first/last on a path that has no metric row returns empty data", async () => {
+    const ctx = setup();
+    try {
+      const base = Date.parse("2026-08-08T00:00:00.000Z");
+      const result = await ctx.provider.getValues({
+        from: new Date(base).toISOString(),
+        to: new Date(base + 60_000).toISOString(),
+        context: "vessels.self",
+        resolution: 60,
+        pathSpecs: [
+          { path: "network.internet.state", aggregate: "last", parameter: [] },
+        ],
+      });
+      assert.deepEqual(result.values, [
+        { path: "network.internet.state", method: "last" },
+      ]);
+      assert.deepEqual(result.data, []);
+    } finally {
+      cleanup(ctx);
+    }
+  });
+
+  test("getValues collates a first/last spec for an unknown path with a known path", async () => {
+    const ctx = setup();
+    try {
+      const speedId = ctx.metric("navigation.speedOverGround");
+      const base = Date.parse("2026-08-08T00:00:00.000Z");
+      ctx.insertReal.run(base, speedId, 5.1, "gps", SELF_CONTEXT);
+
+      const result = await ctx.provider.getValues({
+        from: new Date(base).toISOString(),
+        to: new Date(base + 60_000).toISOString(),
+        context: "vessels.self",
+        resolution: 60,
+        pathSpecs: [
+          {
+            path: "navigation.speedOverGround",
+            aggregate: "last",
+            parameter: [],
+          },
+          { path: "never.seen", aggregate: "last", parameter: [] },
+        ],
+      });
+      assert.deepEqual(result.data, [["2026-08-08T00:00:00.000Z", 5.1, null]]);
+    } finally {
+      cleanup(ctx);
+    }
+  });
+
   test("getContexts and getPaths include string/bool/json tables", async () => {
     const ctx = setup();
     try {

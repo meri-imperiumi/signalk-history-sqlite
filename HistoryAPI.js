@@ -1011,6 +1011,13 @@ class SQLiteHistoryProvider {
     const fn = spec.aggregateFunction;
     const metricId = this.metricIdFor(spec.path);
 
+    // The path has never been recorded (no metrics row), so it cannot have
+    // data in any telemetry table. Return no rows rather than binding an
+    // `undefined` metric_id, which node:sqlite rejects.
+    if (metricId === undefined) {
+      return [];
+    }
+
     if (fn === "first" || fn === "last") {
       // Chronological first/last: pick the value of the row with the
       // smallest/largest ts_ms within each time bucket using a window

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- History API `values` requests no longer fail with "Provided value cannot
+  be bound to SQLite parameter 8" when requesting `first`/`last`
+  aggregation for a path that has never been recorded. Paths without a
+  metrics row are skipped and return no data instead of binding an
+  `undefined` metric id.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
