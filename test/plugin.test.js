@@ -14,7 +14,10 @@ function createMockApp(dataDir) {
     getDataDirPath: () => dataDir,
     debug: () => {},
     error: (msg) => console.error("[ERROR]", msg),
-    setPluginStatus: (_status) => {},
+    setPluginStatus: (status) => {
+      app.statuses.push(status);
+    },
+    statuses: [],
     subscriptionmanager: {
       subscribe: (subscription, _unsubscribes, _onError, onDelta) => {
         subscriptions.push(subscription);
@@ -494,6 +497,137 @@ describe("Plugin", () => {
         assert.deepStrictEqual(row[1], payload);
       },
     );
+  });
+
+  test("should track counts in memory across flushes without table scans", () => {
+    plugin = pluginModule(app);
+    plugin.start({
+      batchSize: 2,
+      batchWriteInterval: 60, // interval never fires; deterministic flushes
+      resolution: 1,
+    });
+
+    const handler = app.getDeltaHandlers()[0];
+    const base = Date.now() - 60_000;
+    for (let i = 0; i < 4; i++) {
+      handler({
+        context: "vessels.self",
+        updates: [
+          {
+            timestamp: new Date(base + i * 100).toISOString(),
+            $source: "test.source",
+            values: [{ path: "navigation.speedOverGround", value: 5 + i }],
+          },
+        ],
+      });
+    }
+    plugin.stop(); // flushes anything left
+
+    const dbPath = path.join(testDataDir, "sqlite-history", "telemetry.db");
+    const db = new DatabaseSync(dbPath);
+    const realCount = db
+      .prepare("SELECT COUNT(*) as count FROM telemetry_real")
+      .get().count;
+    db.close();
+
+    // In-memory counters must match what actually landed in the database
+    assert.strictEqual(realCount, 4);
+    assert.ok(
+      app.statuses.some((s) => s.includes("Total: 2 pts")),
+      `expected a status after the first flush: ${app.statuses.join(" | ")}`,
+    );
+    assert.ok(
+      app.statuses.some((s) => s.includes("Total: 4 pts")),
+      `expected a status after the second flush: ${app.statuses.join(" | ")}`,
+    );
+    const last = app.statuses[app.statuses.length - 1];
+    assert.match(last, /1 metrics/);
+    assert.match(last, /4 values stored/);
+  });
+
+  test("should seed cached stats from an existing database on restart", () => {
+    // First run: write two values spanning two days
+    plugin = pluginModule(app);
+    plugin.start({ batchSize: 10, batchWriteInterval: 60, resolution: 1 });
+    const handler = app.getDeltaHandlers()[0];
+    const base = Date.now() - 5 * 24 * 60 * 60 * 1000;
+    for (const offset of [0, 2 * 24 * 60 * 60 * 1000]) {
+      handler({
+        context: "vessels.self",
+        updates: [
+          {
+            timestamp: new Date(base + offset).toISOString(),
+            $source: "test.source",
+            values: [{ path: "navigation.speedOverGround", value: 5.2 }],
+          },
+        ],
+      });
+    }
+    plugin.stop();
+
+    // Second run against the same data dir
+    const app2 = createMockApp(testDataDir);
+    plugin = pluginModule(app2);
+    plugin.start({ batchSize: 10, batchWriteInterval: 60, resolution: 1 });
+    const readyStatus = app2.statuses.find((s) => s.startsWith("Ready."));
+    assert.ok(readyStatus, `no ready status: ${app2.statuses.join(" | ")}`);
+    assert.match(
+      readyStatus,
+      /2 real.*\(2d\)/,
+      `unexpected initial status: ${readyStatus}`,
+    );
+
+    // One more value on the third day
+    const handler2 = app2.getDeltaHandlers()[0];
+    handler2({
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: new Date(base + 3 * 24 * 60 * 60 * 1000).toISOString(),
+          $source: "test.source",
+          values: [{ path: "navigation.speedOverGround", value: 6.1 }],
+        },
+      ],
+    });
+    plugin.stop();
+    const last = app2.statuses[app2.statuses.length - 1];
+    assert.match(
+      last,
+      /3 values stored \(3d\)/,
+      `unexpected final status: ${last}`,
+    );
+  });
+
+  test("should ignore deltas arriving after stop", () => {
+    plugin = pluginModule(app);
+    plugin.start({ batchSize: 10, batchWriteInterval: 60, resolution: 1 });
+    const handler = app.getDeltaHandlers()[0];
+    handler({
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: new Date().toISOString(),
+          $source: "test.source",
+          values: [{ path: "navigation.speedOverGround", value: 5.2 }],
+        },
+      ],
+    });
+    plugin.stop();
+    const statusesAfterStop = [...app.statuses];
+
+    assert.doesNotThrow(() => {
+      handler({
+        context: "vessels.self",
+        updates: [
+          {
+            timestamp: new Date().toISOString(),
+            $source: "test.source",
+            values: [{ path: "navigation.speedOverGround", value: 6.0 }],
+          },
+        ],
+      });
+    });
+    assert.deepStrictEqual(app.statuses, statusesAfterStop);
   });
 
   test("should register history provider", () => {

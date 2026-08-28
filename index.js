@@ -14,16 +14,34 @@ module.exports = (app) => {
   let db;
   let insertRealStmt;
   let insertBoolStmt;
+  let insertStringStmt;
+  let insertJsonStmt;
   let getMetricStmt;
   let insertMetricStmt;
   let batchBuffer = [];
   let flushInterval;
   let _started = false;
   let dbPath;
+  let pathFilter = null; // { mode, set } precomputed at start; null = store all
+  let maxBufferSize = Infinity;
 
   const metricCache = new Map();
   const lastWriteTime = new Map(); // Track last write time per (path, source, context)
   const selfContext = `vessels.${app.selfId}`;
+
+  // In-memory stats cache. COUNT(*) is O(table size) and node:sqlite is
+  // synchronous, so computing it per flush blocks the Signal K event loop
+  // for hundreds of milliseconds once the database grows. Counts and the
+  // time range are seeded once at start and updated incrementally instead.
+  const statsCache = {
+    metricCount: 0,
+    realCount: 0,
+    boolCount: 0,
+    stringCount: 0,
+    jsonCount: 0,
+    minTs: null,
+    maxTs: null,
+  };
 
   const plugin = {
     id: "signalk-history-sqlite",
@@ -95,6 +113,21 @@ module.exports = (app) => {
 
     start: (options) => {
       _started = true;
+
+      // Precompute the allow/deny path filter once instead of rebuilding a
+      // lookup object for every value
+      pathFilter = null;
+      if (
+        Array.isArray(options.allowOrDenylist) &&
+        options.allowOrDenylist.length > 0 &&
+        typeof options.allowOrDeny !== "undefined"
+      ) {
+        pathFilter = {
+          mode: options.allowOrDeny,
+          set: new Set(options.allowOrDenylist),
+        };
+      }
+      maxBufferSize = 4 * (options.batchSize || 500);
 
       const dbDir = path.join(app.getDataDirPath(), "sqlite-history");
       if (!fs.existsSync(dbDir)) {
@@ -203,10 +236,18 @@ module.exports = (app) => {
       const batchWriteIntervalMs = (options.batchWriteInterval || 1) * 1000;
       flushInterval = setInterval(flushBuffer, batchWriteIntervalMs);
 
-      // Get initial database stats
+      // Get initial database stats and seed the in-memory cache. This is a
+      // one-shot scan; flushes afterwards update the cache incrementally.
       const initialStats = getDatabaseStats();
+      statsCache.metricCount = initialStats.metricCount;
+      statsCache.realCount = initialStats.realCount;
+      statsCache.boolCount = initialStats.boolCount;
+      statsCache.stringCount = initialStats.stringCount;
+      statsCache.jsonCount = initialStats.jsonCount;
+      statsCache.minTs = initialStats.minTs;
+      statsCache.maxTs = initialStats.maxTs;
       setStatus(
-        `Ready. Database: ${formatBytes(initialStats.dbSize)}, ${initialStats.metricCount} metrics, ${initialStats.realCount} real, ${initialStats.boolCount} bool, ${initialStats.stringCount} string, ${initialStats.jsonCount} json values${initialStats.timeRange ? ` (${initialStats.timeRange})` : ""}`,
+        `Ready. Database: ${formatBytes(initialStats.dbSize)}, ${initialStats.metricCount} metrics, ${initialStats.realCount} real, ${initialStats.boolCount} bool, ${initialStats.stringCount} string, ${initialStats.jsonCount} json values${formatTimeRange(initialStats.minTs, initialStats.maxTs)}`,
       );
 
       // Register Signal K subscription stream
@@ -242,17 +283,18 @@ module.exports = (app) => {
       if (flushInterval) clearInterval(flushInterval);
       flushBuffer();
 
-      // Get final stats
+      // Get final stats (one-shot full scan; safe here because the flush
+      // loop has been stopped)
       let finalStatus = "Stopped";
       if (db) {
-        const stats = getDatabaseStats();
+        const finalStats = getDatabaseStats();
         if (
-          stats.realCount > 0 ||
-          stats.boolCount > 0 ||
-          stats.stringCount > 0 ||
-          stats.jsonCount > 0
+          finalStats.realCount > 0 ||
+          finalStats.boolCount > 0 ||
+          finalStats.stringCount > 0 ||
+          finalStats.jsonCount > 0
         ) {
-          finalStatus = `Stopped. Database: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics, ${stats.realCount + stats.boolCount + stats.stringCount + stats.jsonCount} values stored${stats.timeRange ? ` (${stats.timeRange})` : ""}`;
+          finalStatus = `Stopped. Database: ${formatBytes(finalStats.dbSize)}, ${finalStats.metricCount} metrics, ${finalStats.realCount + finalStats.boolCount + finalStats.stringCount + finalStats.jsonCount} values stored${formatTimeRange(finalStats.minTs, finalStats.maxTs)}`;
         }
         db.close();
       }
@@ -267,29 +309,16 @@ module.exports = (app) => {
     let row = getMetricStmt.get(name);
     if (!row) {
       row = insertMetricStmt.get(name);
+      statsCache.metricCount++;
     }
     metricCache.set(name, row.id);
     return row.id;
   }
 
-  function shouldStore(options, path) {
-    if (
-      typeof options.allowOrDenylist !== "undefined" &&
-      typeof options.allowOrDeny !== "undefined" &&
-      options.allowOrDenylist.length > 0
-    ) {
-      const obj = {};
-      options.allowOrDenylist.forEach((element) => {
-        obj[element] = true;
-      });
-
-      if (options.allowOrDeny === "Allow") {
-        return typeof obj[path] !== "undefined";
-      } else {
-        return typeof obj[path] === "undefined";
-      }
-    }
-    return true;
+  function shouldStore(path) {
+    if (!pathFilter) return true;
+    const listed = pathFilter.set.has(path);
+    return pathFilter.mode === "Allow" ? listed : !listed;
   }
 
   function getSourceId(update) {
@@ -306,7 +335,7 @@ module.exports = (app) => {
   }
 
   function handleDelta(delta, options) {
-    if (!delta.updates) return;
+    if (!_started || !delta.updates) return;
 
     // Resolve context
     let context = delta.context;
@@ -329,7 +358,7 @@ module.exports = (app) => {
 
       for (const valObj of update.values) {
         // Check blacklist/whitelist
-        if (!shouldStore(options, valObj.path)) {
+        if (!shouldStore(valObj.path)) {
           continue;
         }
 
@@ -346,6 +375,7 @@ module.exports = (app) => {
           const metricId = getMetricId(valObj.path);
           batchBuffer.push({
             stmt: insertRealStmt,
+            table: "real",
             params: [ts, metricId, value, source, context],
           });
           lastWriteTime.set(metricKey, ts);
@@ -353,6 +383,7 @@ module.exports = (app) => {
           const metricId = getMetricId(valObj.path);
           batchBuffer.push({
             stmt: insertBoolStmt,
+            table: "bool",
             params: [ts, metricId, value ? 1 : 0, source, context],
           });
           lastWriteTime.set(metricKey, ts);
@@ -360,6 +391,7 @@ module.exports = (app) => {
           const metricId = getMetricId(valObj.path);
           batchBuffer.push({
             stmt: insertStringStmt,
+            table: "string",
             params: [ts, metricId, value, source, context],
           });
           lastWriteTime.set(metricKey, ts);
@@ -376,6 +408,7 @@ module.exports = (app) => {
               const lonMetricId = getMetricId("navigation.position.longitude");
               batchBuffer.push({
                 stmt: insertRealStmt,
+                table: "real",
                 params: [ts, lonMetricId, value.longitude, source, context],
               });
             }
@@ -386,6 +419,7 @@ module.exports = (app) => {
               const latMetricId = getMetricId("navigation.position.latitude");
               batchBuffer.push({
                 stmt: insertRealStmt,
+                table: "real",
                 params: [ts, latMetricId, value.latitude, source, context],
               });
             }
@@ -407,11 +441,20 @@ module.exports = (app) => {
               const metricId = getMetricId(valObj.path);
               batchBuffer.push({
                 stmt: insertJsonStmt,
+                table: "json",
                 params: [ts, metricId, serialized, source, context],
               });
               lastWriteTime.set(metricKey, ts);
             }
           }
+        }
+
+        // Safety valve: with the current synchronous flush the buffer
+        // cannot outgrow the batch size, but if flushing ever becomes
+        // asynchronous (e.g. a worker thread) and cannot keep up, drop the
+        // oldest values instead of growing memory without bound
+        if (batchBuffer.length > maxBufferSize) {
+          batchBuffer.splice(0, batchBuffer.length - maxBufferSize);
         }
 
         // Flush if batch size reached
@@ -430,6 +473,21 @@ module.exports = (app) => {
     batchBuffer = [];
     try {
       executeBatchTransaction(chunk);
+
+      // Update the in-memory stats from the flushed chunk instead of
+      // scanning the database: COUNT(*) and range queries over whole
+      // tables are O(database size) and block the event loop
+      for (const item of chunk) {
+        statsCache[`${item.table}Count`] += 1;
+        const ts = item.params[0];
+        if (statsCache.minTs === null || ts < statsCache.minTs) {
+          statsCache.minTs = ts;
+        }
+        if (statsCache.maxTs === null || ts > statsCache.maxTs) {
+          statsCache.maxTs = ts;
+        }
+      }
+
       plugin.totalPointsWritten += chunk.length;
       plugin.throughputPoints += chunk.length;
       plugin.lastWriteTime = Date.now();
@@ -447,10 +505,8 @@ module.exports = (app) => {
         plugin.throughputPoints = 0;
       }
 
-      // Get database stats periodically
-      const stats = getDatabaseStats();
       setStatus(
-        `Writing ~${throughput} pts/s. Batch: ${chunk.length}. Total: ${plugin.totalPointsWritten} pts. DB: ${formatBytes(stats.dbSize)}, ${stats.metricCount} metrics${stats.timeRange ? ` (${stats.timeRange})` : ""}`,
+        `Writing ~${throughput} pts/s. Batch: ${chunk.length}. Total: ${plugin.totalPointsWritten} pts. DB: ${formatBytes(currentDbSize())}, ${statsCache.metricCount} metrics${formatTimeRange(statsCache.minTs, statsCache.maxTs)}`,
       );
     } catch (err) {
       logError(`Failed to flush batch to SQLite: ${err.message}`);
@@ -458,7 +514,23 @@ module.exports = (app) => {
     }
   }
 
+  function currentDbSize() {
+    try {
+      return fs.statSync(dbPath).size;
+    } catch (_e) {
+      return 0;
+    }
+  }
+
+  function formatTimeRange(minTs, maxTs) {
+    if (minTs === null || maxTs === null) return "";
+    const days = Math.round((maxTs - minTs) / (24 * 60 * 60 * 1000));
+    return ` (${days}d)`;
+  }
+
   function getDatabaseStats() {
+    // One-shot stats for start/stop. Never call this from the flush hot
+    // path: the COUNT(*) queries scan whole tables.
     try {
       const metricCount = db
         .prepare("SELECT COUNT(*) as count FROM metrics")
@@ -476,36 +548,25 @@ module.exports = (app) => {
         .prepare("SELECT COUNT(*) as count FROM telemetry_json")
         .get().count;
 
-      let dbSize = 0;
-      try {
-        const stats = fs.statSync(dbPath);
-        dbSize = stats.size;
-      } catch (_e) {
-        // File stats not available
-      }
-
-      // Get time range of stored data
-      let timeRange = null;
-      if (realCount > 0 || stringCount > 0 || jsonCount > 0 || boolCount > 0) {
-        // Use UNION ALL to get time range across all telemetry tables
+      // Direct per-table MIN/MAX queries use the PK index (~0.5 ms at a
+      // million rows); wrapping them in a UNION ALL subquery forced a full
+      // scan of every table (~850 ms at a million rows on a low-power SBC)
+      let minTs = null;
+      let maxTs = null;
+      for (const table of [
+        "telemetry_real",
+        "telemetry_bool",
+        "telemetry_string",
+        "telemetry_json",
+      ]) {
         const range = db
-          .prepare(`
-            SELECT MIN(ts_ms) as min_ts, MAX(ts_ms) as max_ts FROM (
-              SELECT ts_ms FROM telemetry_real
-              UNION ALL
-              SELECT ts_ms FROM telemetry_bool
-              UNION ALL
-              SELECT ts_ms FROM telemetry_string
-              UNION ALL
-              SELECT ts_ms FROM telemetry_json
-            )
-          `)
+          .prepare(`SELECT MIN(ts_ms) AS mn, MAX(ts_ms) AS mx FROM ${table}`)
           .get();
-        if (range.min_ts && range.max_ts) {
-          const days = Math.round(
-            (range.max_ts - range.min_ts) / (24 * 60 * 60 * 1000),
-          );
-          timeRange = `${days}d`;
+        if (range.mn !== null && (minTs === null || range.mn < minTs)) {
+          minTs = range.mn;
+        }
+        if (range.mx !== null && (maxTs === null || range.mx > maxTs)) {
+          maxTs = range.mx;
         }
       }
 
@@ -515,8 +576,9 @@ module.exports = (app) => {
         boolCount,
         stringCount,
         jsonCount,
-        dbSize,
-        timeRange,
+        dbSize: currentDbSize(),
+        minTs,
+        maxTs,
       };
     } catch (_err) {
       return {
@@ -526,7 +588,8 @@ module.exports = (app) => {
         stringCount: 0,
         jsonCount: 0,
         dbSize: 0,
-        timeRange: null,
+        minTs: null,
+        maxTs: null,
       };
     }
   }
