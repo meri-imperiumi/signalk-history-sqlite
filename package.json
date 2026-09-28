@@ -38,7 +38,7 @@
   },
   "signalk": {
     "displayName": "SQLite History Provider",
-    "appIcon": "./icon.png",
+    "appIcon": "./icon-256.png",
     "screenshots": [
       "./screenshot.png"
     ]
